@@ -1,6 +1,12 @@
 import hashlib
 import io
+import os
 import random
+import subprocess
+import tempfile
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 from PIL import Image
 
@@ -43,6 +49,42 @@ def generate_png_bytes(width, height, color):
     byte_io.close()
 
     return byte_data
+
+
+def generate_mp4_bytes(width, height, start_color, duration=5):
+    """
+    Generates an MP4 video with an animated color using ffmpeg.
+
+    Args:
+        width (int): Width of the video.
+        height (int): Height of the video.
+        start_color (tuple): Color as (R, G, B).
+        duration (int): Duration of the video in seconds.
+
+    Returns:
+        bytes: Byte array representing the MP4 video.
+    """
+    r, g, b = start_color
+
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'lavfi', '-i', f'color=c=#{r:02x}{g:02x}{b:02x}:s={width}x{height}', '-t', str(duration),
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-an',
+            '-f', 'mp4', tmp_path
+        ]
+
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            print(f"FFmpeg error: {result.stderr.decode()}")
+
+        with open(tmp_path, 'rb') as f:
+            return f.read()
+    finally:
+        os.unlink(tmp_path)
 
 
 def get_color_from_seed(seed_string):
@@ -170,6 +212,53 @@ def generate_dummy_events(start_time, end_time, min_interval=30, max_events=50):
     return events
 
 
+class VideoServer:
+    def __init__(self, port=8080):
+        self.port = port
+        self.video_cache = {}
+        self._server = None
+        self._handler = None
+
+    def register_video(self, video_id: str, mp4_bytes: bytes) -> None:
+        self.video_cache[video_id] = mp4_bytes
+
+    def has_video(self, video_id: str) -> bool:
+        return video_id in self.video_cache
+
+    def _create_handler(self):
+        video_cache = self.video_cache
+
+        class RequestHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                parsed_path = urlparse(self.path)
+                path = parsed_path.path.lstrip('/')
+                if path in video_cache:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'video/mp4')
+                    self.send_header('Content-Length', str(len(video_cache[path])))
+                    self.end_headers()
+                    self.wfile.write(video_cache[path])
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        return RequestHandler
+
+    def start(self):
+        self._handler = self._create_handler()
+        self._server = HTTPServer(('', self.port), self._handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        print(f"Video server running on port {self.port}")
+
+    def stop(self):
+        if self._server:
+            self._server.shutdown()
+
+
 class EventManager:
     def __init__(self):
         # This will store all generated events and their time ranges
@@ -294,9 +383,26 @@ class VideoClipsTester(ScryptedDeviceBase, VideoClips):
     def __init__(self, nativeId=None) -> None:
         super().__init__(nativeId)
         self.event_manager = EventManager()
+        self.video_server = VideoServer(port=8765)
+        self.video_server.start()
 
     async def getVideoClip(self, videoId: str) -> MediaObject:
-        raise NotImplementedError("Method not implemented")
+        event = self.event_manager.find_event_by_start_time(int(videoId))
+        if not event:
+            return None
+
+        mp4_key = videoId + ".mp4"
+        if not self.video_server.has_video(mp4_key):
+            color = get_color_from_seed(f"event_{event['start_time']}_{event['end_time']}")
+            duration = event['end_time'] - event['start_time']
+            video_bytes = generate_mp4_bytes(200, 200, color, max(duration, 1))
+            self.video_server.register_video(mp4_key, video_bytes)
+
+        video_url = f"http://localhost:{self.video_server.port}/{mp4_key}"
+        mo = await scrypted_sdk.mediaManager.createFFmpegMediaObject({
+            "url": video_url,
+        })
+        return mo
 
     async def getVideoClipThumbnail(self, thumbnailId: str, options: VideoClipThumbnailOptions = None) -> scrypted_sdk.MediaObject:
         event = self.event_manager.find_event_by_start_time(int(thumbnailId))
