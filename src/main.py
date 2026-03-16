@@ -137,76 +137,53 @@ def select_detection_classes(seed_string):
     return selected_classes
 
 
-def scale_max_events(duration, min_interval=30, max_events=50):
+BLOCK_DURATION = 20 * 60   # 20-minute blocks in seconds
+MAX_EVENTS_PER_BLOCK = 5
+
+
+def generate_dummy_events(block_start, block_end):
     """
-    Scales the maximum number of events based on the duration.
+    Generates up to MAX_EVENTS_PER_BLOCK dummy object detection events for a single
+    20-minute aligned block.  The number of events (0..MAX_EVENTS_PER_BLOCK) is chosen
+    deterministically from the block boundaries so the same block always produces the
+    same events.
 
     Args:
-        duration (int): The total duration in seconds.
-        min_interval (int): The minimum time interval between events in seconds.
-        max_events (int): The absolute maximum number of events to allow.
+        block_start (int): Block start time in seconds (aligned to BLOCK_DURATION).
+        block_end (int): Block end time in seconds (block_start + BLOCK_DURATION).
 
     Returns:
-        int: The scaled maximum number of events based on the duration.
+        list: A list of event dicts for this block.
     """
-    # Calculate how many events can reasonably fit within the duration
-    scaled_events = duration // min_interval
-
-    # Ensure the number of events doesn't exceed the absolute maximum
-    return min(scaled_events, max_events)
-
-
-def generate_dummy_events(start_time, end_time, min_interval=30, max_events=50):
-    """
-    Generates a list of dummy object detection events scaled according to the time range.
-
-    Args:
-        start_time (int): Start time in seconds.
-        end_time (int): End time in seconds.
-        min_interval (int): Minimum time interval between events in seconds.
-        max_events (int): Absolute maximum number of events to generate.
-
-    Returns:
-        list: A list of dictionaries representing the dummy events.
-              Each event includes a start time, end time, and a random image as bytes.
-    """
-    # List to store the generated events
     events = []
 
-    # Calculate the duration of the period
-    duration = end_time - start_time
-
-    # Return an empty list if the time range is invalid
+    duration = block_end - block_start
     if duration <= 0:
         return events
 
-    # Scale the number of events based on the duration
-    scaled_max_events = scale_max_events(duration, min_interval, max_events)
+    # Seed once per block so num_events and all event positions are deterministic.
+    block_seed = f"block_{block_start}_{block_end}"
+    seed_hash = hashlib.md5(block_seed.encode()).hexdigest()
+    rng = random.Random(seed_hash)
 
-    # Randomly choose the number of events to generate (it could be zero)
-    num_events = random.randint(0, scaled_max_events)
+    num_events = rng.randint(0, MAX_EVENTS_PER_BLOCK)
 
-    for _ in range(num_events):
-        # Randomly generate a start time within the time range
-        event_start = random.randint(start_time, end_time - 1)
+    for i in range(num_events):
+        event_seed = f"event_{block_start}_{i}"
 
-        # Randomly generate a duration for the event, ensuring it ends before the end_time
-        max_duration = end_time - event_start
-        event_duration = random.randint(1, min(min_interval, max_duration))  # Ensure short events
+        event_start = rng.randint(block_start, block_end - 1)
+        max_duration = block_end - event_start
+        event_duration = rng.randint(1, min(30, max_duration))
         event_end = event_start + event_duration
 
-        # Generate a random color for the detection snapshot
-        event_color = get_color_from_seed(f"event_{event_start}_{event_end}")
-
-        # Generate an image as a snapshot for the event
+        event_color = get_color_from_seed(event_seed)
         image_bytes = generate_png_bytes(200, 200, event_color)
 
-        # Add the event to the list
         events.append({
             "start_time": event_start,
             "end_time": event_end,
-            "snapshot": image_bytes,  # Image data in bytes
-            "detection_classes": select_detection_classes(f"event_{event_start}_{event_end}"),
+            "snapshot": image_bytes,
+            "detection_classes": select_detection_classes(event_seed),
         })
 
     return events
@@ -261,121 +238,94 @@ class VideoServer:
 
 class EventManager:
     def __init__(self):
-        # This will store all generated events and their time ranges
-        self.generated_events = []
+        # Maps block_start (int, seconds) -> list of event dicts for that block.
+        # Blocks are BLOCK_DURATION-second windows aligned to multiples of BLOCK_DURATION.
+        self._block_cache: dict[int, list[dict]] = {}
 
-    def _is_overlapping(self, range1, range2):
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _block_start_for(self, t: int) -> int:
+        """Return the aligned block start time that contains timestamp t."""
+        return (t // BLOCK_DURATION) * BLOCK_DURATION
+
+    def _blocks_for_range(self, start_time: int, end_time: int) -> list[int]:
         """
-        Check if two time ranges overlap.
+        Return an ordered list of block start times whose blocks overlap
+        [start_time, end_time).
+        """
+        first_block = self._block_start_for(start_time)
+        blocks = []
+        b = first_block
+        while b < end_time:
+            blocks.append(b)
+            b += BLOCK_DURATION
+        return blocks
+
+    def _get_or_generate_block(self, block_start: int) -> list[dict]:
+        """
+        Return the cached events for a block, generating and caching them first
+        if this block has not yet been seen.
+        """
+        if block_start not in self._block_cache:
+            block_end = block_start + BLOCK_DURATION
+            self._block_cache[block_start] = generate_dummy_events(block_start, block_end)
+        return self._block_cache[block_start]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def generate_events_for_range(self, start_time: int, end_time: int,
+                                   detection_classes: list[str] | None = None) -> list[dict]:
+        """
+        Return all events that fall within [start_time, end_time), optionally
+        filtered by detection class.
+
+        Each 20-minute aligned block touched by the range is generated on first
+        access and cached permanently; subsequent calls for the same block reuse
+        the cached events and only apply the filter.
 
         Args:
-            range1 (tuple): (start_time, end_time) of the first range.
-            range2 (tuple): (start_time, end_time) of the second range.
+            start_time (int): Range start in seconds.
+            end_time (int): Range end in seconds.
+            detection_classes (list[str] | None): If provided, only events that
+                share at least one class with this list are returned.
 
         Returns:
-            bool: True if the ranges overlap, False otherwise.
+            list[dict]: Matching events sorted by start_time.
         """
-        return not (range1[1] <= range2[0] or range2[1] <= range1[0])
+        result = []
 
-    def _find_overlapping_segments(self, start_time, end_time):
-        """
-        Find all segments of the requested time range that overlap with existing events.
+        for block_start in self._blocks_for_range(start_time, end_time):
+            for event in self._get_or_generate_block(block_start):
+                # Restrict to events that start within the requested range.
+                if not (start_time <= event["start_time"] < end_time):
+                    continue
+                # Apply optional detection-class filter.
+                if detection_classes:
+                    if not any(c in event["detection_classes"] for c in detection_classes):
+                        continue
+                result.append(event)
 
-        Args:
-            start_time (int): Start time of the requested range.
-            end_time (int): End time of the requested range.
+        result.sort(key=lambda e: e["start_time"])
+        return result
 
-        Returns:
-            list: A list of tuples representing the overlapping segments
-                  and their corresponding events.
-        """
-        overlapping_segments = []
-        requested_range = (start_time, end_time)
-
-        for event_range, events in self.generated_events:
-            if self._is_overlapping(requested_range, event_range):
-                # Calculate the overlapping part of the ranges
-                overlap_start = max(start_time, event_range[0])
-                overlap_end = min(end_time, event_range[1])
-                overlapping_segments.append(((overlap_start, overlap_end), events))
-
-        return overlapping_segments
-
-    def _generate_and_cache_events(self, start_time, end_time):
-        """
-        Generate new events for the given time range and cache them.
-
-        Args:
-            start_time (int): Start time in seconds.
-            end_time (int): End time in seconds.
-
-        Returns:
-            list: A list of newly generated events.
-        """
-        new_events = generate_dummy_events(start_time, end_time)
-        self.generated_events.append(((start_time, end_time), new_events))
-        return new_events
-
-    def generate_events_for_range(self, start_time, end_time):
-        """
-        Generates events for a given time range if they don't already exist.
-        In case of partial overlap, reuse existing events and generate for the remaining time range.
-
-        Args:
-            start_time (int): Start time in seconds.
-            end_time (int): End time in seconds.
-
-        Returns:
-            list: A list of events (either existing or newly generated).
-        """
-        # Step 1: Find overlapping segments
-        overlapping_segments = self._find_overlapping_segments(start_time, end_time)
-
-        # Step 2: Track what time ranges still need event generation
-        uncovered_ranges = []
-        last_covered_time = start_time
-
-        for overlap_range, _ in overlapping_segments:
-            if last_covered_time < overlap_range[0]:
-                # There's an uncovered range before the overlap
-                uncovered_ranges.append((last_covered_time, overlap_range[0]))
-
-            # Move the last covered time forward
-            last_covered_time = overlap_range[1]
-
-        # After the last overlap, check if there's still an uncovered range
-        if last_covered_time < end_time:
-            uncovered_ranges.append((last_covered_time, end_time))
-
-        # Step 3: Generate events for the uncovered ranges and cache them
-        new_events = []
-        for uncovered_range in uncovered_ranges:
-            uncovered_start, uncovered_end = uncovered_range
-            new_events += self._generate_and_cache_events(uncovered_start, uncovered_end)
-
-        # Step 4: Combine existing (overlapping) events with newly generated ones
-        combined_events = []
-        for overlap_range, events in overlapping_segments:
-            combined_events += events
-
-        combined_events += new_events
-
-        return combined_events
-
-    def find_event_by_start_time(self, start_time):
+    def find_event_by_start_time(self, start_time: int) -> dict | None:
         """
         Finds an event by its start time.
 
         Args:
-            start_time (int): Start time of the event to find.
+            start_time (int): Start time of the event to find (seconds).
 
         Returns:
             dict: The event dictionary if found, None otherwise.
         """
-        for _, events in self.generated_events:
-            for event in events:
-                if event["start_time"] == start_time:
-                    return event
+        block_start = self._block_start_for(start_time)
+        for event in self._get_or_generate_block(block_start):
+            if event["start_time"] == start_time:
+                return event
         return None
 
 
@@ -413,7 +363,13 @@ class VideoClipsTester(ScryptedDeviceBase, VideoClips):
         return mo
 
     async def getVideoClips(self, options: VideoClipOptions = None) -> list[VideoClip]:
-        events = self.event_manager.generate_events_for_range(int(options["startTime"] / 1000), int(options["endTime"] / 1000))
+        start_time = int(options["startTime"] / 1000)
+        end_time = int(options["endTime"] / 1000)
+        detection_classes = options.get("detectionClasses") if options else None
+
+        events = self.event_manager.generate_events_for_range(
+            start_time, end_time, detection_classes=detection_classes
+        )
         clips = []
         for event in events:
             clip = {
