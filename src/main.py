@@ -122,7 +122,7 @@ def select_detection_classes(seed_string):
         list: A list of randomly selected detection classes.
     """
     # List of possible detection classes
-    detection_classes = ['motion', 'person', 'vehicle', 'animal', 'package']
+    detection_classes = ['person', 'vehicle', 'animal', 'package']
 
     # Create a deterministic hash from the seed string
     seed_hash = hashlib.md5(seed_string.encode()).hexdigest()
@@ -131,8 +131,12 @@ def select_detection_classes(seed_string):
     random.seed(seed_hash)
 
     # Randomly select a subset of the detection classes (it could be empty or full)
-    num_classes = random.randint(0, len(detection_classes))  # Select between 0 and all classes
+    num_classes = random.randint(1, 2)  # Select between 0 and 2 classes
     selected_classes = random.sample(detection_classes, num_classes)
+
+    # Select 'motion' class with a 50% chance, independent of the others
+    if random.random() < 0.5:
+        selected_classes.append('motion')
 
     return selected_classes
 
