@@ -57,20 +57,28 @@ def generate_png_bytes(width, height, color):
     return byte_data
 
 
-def generate_mp4_bytes(width, height, start_color, duration=5):
+def generate_mp4_bytes(width, height, start_color, duration=5, start_time=0):
     """
-    Generates an MP4 video with an animated color using ffmpeg.
+    Generates an MP4 video with a CCTV-style timestamp overlay.
 
     Args:
         width (int): Width of the video.
         height (int): Height of the video.
         start_color (tuple): Color as (R, G, B).
         duration (int): Duration of the video in seconds.
+        start_time (int): Unix timestamp for the start of the clip (seconds).
 
     Returns:
         bytes: Byte array representing the MP4 video.
     """
     r, g, b = start_color
+
+    # drawtext ticks the clock each second by adding floor(n/r) to start_time
+    timestamp_filter = (
+        f"drawtext=fontsize=14:fontcolor=white:borderw=1:bordercolor=black"
+        f":x=5:y=5"
+        f":text='%{{pts\\:localtime\\:{start_time}\\:%Y-%m-%d %H\\\\\\:%M\\\\\\:%S}}'"
+    )
 
     with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
         tmp_path = tmp.name
@@ -79,6 +87,7 @@ def generate_mp4_bytes(width, height, start_color, duration=5):
         cmd = [
             'ffmpeg', '-y',
             '-f', 'lavfi', '-i', f'color=c=#{r:02x}{g:02x}{b:02x}:s={width}x{height}', '-t', str(duration),
+            '-vf', timestamp_filter,
             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'ultrafast', '-an',
             '-f', 'mp4', tmp_path
         ]
@@ -367,7 +376,7 @@ class VideoClipsTester(ScryptedDeviceBase, VideoClips):
         if not self.video_server.has_video(mp4_key):
             color = get_color_from_seed(event['seed'])
             duration = event['end_time'] - event['start_time']
-            video_bytes = generate_mp4_bytes(200, 200, color, max(duration, 1))
+            video_bytes = generate_mp4_bytes(200, 200, color, max(duration, 1), start_time=event['start_time'])
             self.video_server.register_video(mp4_key, video_bytes)
 
         video_url = f"http://localhost:{self.video_server.port}/{mp4_key}"
