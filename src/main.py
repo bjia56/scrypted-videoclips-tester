@@ -188,6 +188,7 @@ def generate_dummy_events(block_start, block_end):
             "end_time": event_end,
             "snapshot": image_bytes,
             "detection_classes": select_detection_classes(event_seed),
+            "seed": event_seed,
         })
 
     return events
@@ -347,7 +348,7 @@ class VideoClipsTester(ScryptedDeviceBase, VideoClips):
 
         mp4_key = videoId + ".mp4"
         if not self.video_server.has_video(mp4_key):
-            color = get_color_from_seed(f"event_{event['start_time']}_{event['end_time']}")
+            color = get_color_from_seed(event['seed'])
             duration = event['end_time'] - event['start_time']
             video_bytes = generate_mp4_bytes(200, 200, color, max(duration, 1))
             self.video_server.register_video(mp4_key, video_bytes)
