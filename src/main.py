@@ -1,5 +1,7 @@
+import datetime
 import hashlib
 import io
+import json
 import os
 import random
 import subprocess
@@ -19,6 +21,10 @@ from scrypted_sdk import (
     VideoClipThumbnailOptions,
     MediaObject,
 )
+
+
+FILES_PATH = os.path.join(os.environ['SCRYPTED_PLUGIN_VOLUME'], 'files')
+
 
 def generate_png_bytes(width, height, color):
     """
@@ -180,13 +186,9 @@ def generate_dummy_events(block_start, block_end):
         event_duration = rng.randint(1, min(30, max_duration))
         event_end = event_start + event_duration
 
-        event_color = get_color_from_seed(event_seed)
-        image_bytes = generate_png_bytes(200, 200, event_color)
-
         events.append({
             "start_time": event_start,
             "end_time": event_end,
-            "snapshot": image_bytes,
             "detection_classes": select_detection_classes(event_seed),
             "seed": event_seed,
         })
@@ -246,6 +248,7 @@ class EventManager:
         # Maps block_start (int, seconds) -> list of event dicts for that block.
         # Blocks are BLOCK_DURATION-second windows aligned to multiples of BLOCK_DURATION.
         self._block_cache: dict[int, list[dict]] = {}
+        os.makedirs(FILES_PATH, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -268,14 +271,27 @@ class EventManager:
             b += BLOCK_DURATION
         return blocks
 
+    def _block_path(self, block_start: int) -> str:
+        date_str = datetime.datetime.fromtimestamp(block_start, datetime.timezone.utc).strftime('%Y-%m-%d')
+        return os.path.join(FILES_PATH, date_str, f"block_{block_start}.json")
+
     def _get_or_generate_block(self, block_start: int) -> list[dict]:
         """
-        Return the cached events for a block, generating and caching them first
-        if this block has not yet been seen.
+        Return the cached events for a block, loading from disk or generating
+        and persisting them if not yet seen.
         """
         if block_start not in self._block_cache:
-            block_end = block_start + BLOCK_DURATION
-            self._block_cache[block_start] = generate_dummy_events(block_start, block_end)
+            path = self._block_path(block_start)
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    self._block_cache[block_start] = json.load(f)
+            else:
+                block_end = block_start + BLOCK_DURATION
+                events = generate_dummy_events(block_start, block_end)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, 'w') as f:
+                    json.dump(events, f)
+                self._block_cache[block_start] = events
         return self._block_cache[block_start]
 
     # ------------------------------------------------------------------
@@ -340,6 +356,7 @@ class VideoClipsTester(ScryptedDeviceBase, VideoClips):
         self.event_manager = EventManager()
         self.video_server = VideoServer(port=8765)
         self.video_server.start()
+        self._png_cache: dict[str, bytes] = {}
 
     async def getVideoClip(self, videoId: str) -> MediaObject:
         event = self.event_manager.find_event_by_start_time(int(videoId))
@@ -364,7 +381,10 @@ class VideoClipsTester(ScryptedDeviceBase, VideoClips):
         if not event:
             return None
 
-        mo = await scrypted_sdk.mediaManager.createMediaObject(event["snapshot"], "image/png")
+        seed = event['seed']
+        if seed not in self._png_cache:
+            self._png_cache[seed] = generate_png_bytes(200, 200, get_color_from_seed(seed))
+        mo = await scrypted_sdk.mediaManager.createMediaObject(self._png_cache[seed], "image/png")
         return mo
 
     async def getVideoClips(self, options: VideoClipOptions = None) -> list[VideoClip]:
