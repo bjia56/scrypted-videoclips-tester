@@ -1,13 +1,13 @@
 {
    "name": "@bjia56/scrypted-videoclips-tester",
-   "version": "0.0.0",
+   "version": "0.0.1",
    "description": "Test device implementing the VideoClips interface",
    "license": "Apache",
    "keywords": [
+      "scrypted",
+      "plugin",
       "test",
       "debug",
-      "video",
-      "clips",
       "videoclips"
    ],
    "scripts": {
