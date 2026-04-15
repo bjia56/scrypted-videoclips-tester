@@ -146,7 +146,7 @@ def select_detection_classes(seed_string):
     random.seed(seed_hash)
 
     # Randomly select a subset of the detection classes (it could be empty or full)
-    num_classes = random.randint(1, 2)  # Select between 0 and 2 classes
+    num_classes = random.randint(0, 2)  # Select between 0 and 2 classes
     selected_classes = random.sample(detection_classes, num_classes)
 
     # Select 'motion' class with a 50% chance, independent of the others
